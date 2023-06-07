@@ -5,9 +5,26 @@ import (
 	"time"
 )
 
-type Config struct {
-	Expire   time.Duration
-	GcPeriod time.Duration
+type StashEvent int
+
+func (e StashEvent) String() string {
+	switch e {
+	case OnGet:
+		return "GET"
+	case OnSet:
+		return "SET"
+	case OnUpdate:
+		return "UPDATE"
+	case OnTouch:
+		return "TOUCH"
+	case OnRemove:
+		return "REMOVE"
+	case OnExpire:
+		return "EXPIRE"
+	case OnFlush:
+		return "FLUSH"
+	}
+	return "[UNDEFINED]"
 }
 
 type Stash struct {
@@ -30,27 +47,32 @@ func (item item) Expired() bool {
 type stash struct {
 	expirePeriod time.Duration
 	gcPeriod     time.Duration
+	lenLimit     int
+	lenCurrent   int
 	items        map[string]*item
 	mu           sync.RWMutex
-	onExpire     OnExpireHandler
+	onEvent      OnEventHandler
 	gc           *gc
 }
 
 // Set Add an item to the stash, replacing any existing item.
 // If the duration is 0 (DefaultExpiration), the stash's default expiration time is used.
 // If it is -1 (NoExpire), the item never expires.
-func (c *stash) Set(k string, i ...interface{}) {
+func (c *stash) Set(k string, i ...interface{}) bool {
 	if len(i) == 0 || i[0] == nil {
-		return
+		return false
+	}
+	if c.lenLimit > 0 && c.lenCurrent >= c.lenLimit {
+		return false
 	}
 	var expire *time.Time
 	if len(i) > 1 {
-		expire = c.toTime(i[2])
+		expire = c.toTime(i[1])
 	} else {
 		expire = c.toTime(c.expirePeriod)
 	}
 	if expire != nil && expire.Before(time.Now()) {
-		return
+		return false
 	}
 	c.mu.Lock()
 	if v, ok := c.items[k]; ok {
@@ -61,10 +83,12 @@ func (c *stash) Set(k string, i ...interface{}) {
 			Object: i[0],
 			expire: expire,
 		}
+		c.lenCurrent = len(c.items)
 	}
 	// Calls to mu.Unlock are currently not deferred because defer
 	// adds ~200 ns (as of go1.)
 	c.mu.Unlock()
+	return true
 }
 
 // Touch if item exist in stash stash, replacing any existing item.
@@ -92,12 +116,22 @@ func (c *stash) Touch(key string, i ...interface{}) (touched bool) {
 // Remove an item from the stash.
 // Returns the item or nil,// and a bool indicating if the key was found and deleted.
 func (c *stash) Remove(key string) (interface{}, bool) {
+	return c.remove(key, OnRemove)
+}
+
+// Remove an item from the stash.
+// Returns the item or nil,// and a bool indicating if the key was found and deleted.
+func (c *stash) remove(key string, event StashEvent) (interface{}, bool) {
 	c.mu.Lock()
 	o, ok := c.items[key]
 	if ok {
 		delete(c.items, key)
+		c.lenCurrent = len(c.items)
 	}
 	c.mu.Unlock()
+	if ok && c.onEvent != nil {
+		go c.onEvent(event, key, o.Object)
+	}
 	return o, ok
 }
 
@@ -117,21 +151,27 @@ func (c *stash) Get(k string) (interface{}, bool) {
 // Len Returns the number of items in the stash. This may include items that have
 // expired, but have not yet been cleaned up.
 func (c *stash) Len() int {
-	c.mu.RLock()
-	n := len(c.items)
-	c.mu.RUnlock()
-	return n
+	return c.lenCurrent
 }
 
 // Clean Delete all items from the stash.
 func (c *stash) Clean() {
 	c.mu.Lock()
 	c.items = make(map[string]*item)
+	c.lenCurrent = len(c.items)
 	c.mu.Unlock()
+	if c.onEvent != nil {
+		go c.onEvent(OnClean, "", nil)
+	}
 }
 
 // Flush Delete expired items from the stash.
 func (c *stash) Flush() {
+	c.expire(OnFlush)
+}
+
+// Flush Delete expired items from the stash.
+func (c *stash) expire(event StashEvent) {
 	expiredItems := make(map[string]interface{})
 	c.mu.RLock()
 	for key, item := range c.items {
@@ -141,21 +181,10 @@ func (c *stash) Flush() {
 	}
 	c.mu.RUnlock()
 	go func(removed map[string]interface{}) {
-		for key, obj := range removed {
-			c.Remove(key)
-			if c.onExpire != nil {
-				go c.onExpire(key, obj)
-			}
+		for key, _ := range removed {
+			c.remove(key, event)
 		}
 	}(expiredItems)
-}
-
-// OnExpire Sets an (optional) function that is called with the key and value when an
-// item is evicted from the stash by expire.
-func (c *stash) OnExpire(f func(string, interface{})) {
-	c.mu.Lock()
-	c.onExpire = f
-	c.mu.Unlock()
 }
 
 func (c *stash) toTime(i interface{}) *time.Time {
@@ -193,7 +222,7 @@ func (j *gc) Run(c *stash) {
 	for {
 		select {
 		case <-ticker.C:
-			c.Flush()
+			c.expire(OnExpire)
 		case <-j.stop:
 			ticker.Stop()
 			return
