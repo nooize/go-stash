@@ -8,10 +8,13 @@ import (
 
 func main() {
 
+	stats := new(stash.Stats)
+
 	cache := stash.New(
 		stash.GcPeriod(50*time.Millisecond),
 		stash.ExpireAfter(30*time.Second),
-		stash.EventHandler(handleChange),
+		stash.OnEvent(stats.EventHandler, stash.EventAny),
+		stash.OnEvent(handleChange, stash.EventExpire, stash.EventFlush),
 	)
 
 	cache.Set("key-0", "000", stash.NoExpire)
@@ -25,6 +28,7 @@ func main() {
 	log.Printf("wake ip again !  len: %v", cache.Len())
 	cache.Clean()
 	log.Printf("finish. len: %v", cache.Len())
+	log.Printf("Stats > %s", stats.String())
 }
 
 func handleChange(e stash.StashEvent, k string, v interface{}) {

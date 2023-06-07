@@ -6,17 +6,6 @@ import (
 )
 
 const (
-	OnGet StashEvent = iota
-	OnSet
-	OnUpdate
-	OnTouch
-	OnRemove
-	OnExpire
-	OnFlush
-	OnClean
-)
-
-const (
 	// NoSizeLimit - For use with functions that take an expiration time.
 	NoSizeLimit int = 0
 
@@ -29,8 +18,6 @@ const (
 
 	DefaultCgPeriod = 5 * time.Minute
 )
-
-type OnEventHandler func(StashEvent, string, interface{})
 
 func New(opts ...func(*stash)) *Stash {
 	c := &stash{
@@ -72,8 +59,15 @@ func GcPeriod(dur time.Duration) func(*stash) {
 	}
 }
 
-func EventHandler(h OnEventHandler) func(*stash) {
+func OnEvent(handler OnEventHandler, events ...StashEvent) func(*stash) {
 	return func(c *stash) {
-		c.onEvent = h
+		if handler == nil || len(events) == 0 {
+			return
+		}
+		c.events = &eventHandler{
+			events:  events,
+			handler: handler,
+			next:    c.events,
+		}
 	}
 }
