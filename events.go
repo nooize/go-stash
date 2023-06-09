@@ -1,21 +1,23 @@
 package stash
 
 const (
-	EventAny StashEvent = iota
+	EventAny Event = iota
 	EventGet
 	EventMiss
 	EventSet
 	EventUpdate
 	EventTouch
+	EventError
 	EventRemove
 	EventExpire
 	EventFlush
 	EventClean
 )
 
-type StashEvent int
+// Event represents a stash event type.
+type Event int
 
-func (e StashEvent) String() string {
+func (e Event) String() string {
 	switch e {
 	case EventAny:
 		return "*"
@@ -39,17 +41,16 @@ func (e StashEvent) String() string {
 	return "[UNDEFINED]"
 }
 
-// type OnHandler func(StashEvent, string, interface{})
-
-type OnEventHandler func(StashEvent, string, interface{})
+// OnEventHandler is the type of the function called when an stash event is fired.
+type OnEventHandler func(Event, string, interface{})
 
 type eventHandler struct {
-	events  []StashEvent
+	events  []Event
 	handler OnEventHandler
 	next    *eventHandler
 }
 
-func (h *eventHandler) fire(event StashEvent, key string, val interface{}) {
+func (h *eventHandler) fire(event Event, key string, val interface{}) {
 	if h == nil {
 		return
 	}

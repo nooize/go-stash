@@ -12,6 +12,7 @@ type Stats struct {
 	sets    atomic.Uint64
 	updates atomic.Uint64
 	touches atomic.Uint64
+	errors  atomic.Uint64
 	removes atomic.Uint64
 	expires atomic.Uint64
 	flushes atomic.Uint64
@@ -35,6 +36,10 @@ func (i *Stats) Updates() uint64 {
 
 func (i *Stats) Touches() uint64 {
 	return i.touches.Load()
+}
+
+func (i *Stats) Errors() uint64 {
+	return i.errors.Load()
 }
 
 func (i *Stats) Removes() uint64 {
@@ -66,6 +71,9 @@ func (i *Stats) String() string {
 	if v := i.Touches(); v > 0 {
 		parts = append(parts, "touch:", strconv.FormatUint(v, 10))
 	}
+	if v := i.Errors(); v > 0 {
+		parts = append(parts, "errors:", strconv.FormatUint(v, 10))
+	}
 	if v := i.Removes(); v > 0 {
 		parts = append(parts, "remove:", strconv.FormatUint(v, 10))
 	}
@@ -78,7 +86,7 @@ func (i *Stats) String() string {
 	return strings.Join(parts, " ")
 }
 
-func (i *Stats) EventHandler(event StashEvent, key string, obj interface{}) {
+func (i *Stats) EventHandler(event Event, key string, obj interface{}) {
 	switch event {
 	case EventGet:
 		i.gets.Add(1)
@@ -90,6 +98,8 @@ func (i *Stats) EventHandler(event StashEvent, key string, obj interface{}) {
 		i.updates.Add(1)
 	case EventTouch:
 		i.touches.Add(1)
+	case EventError:
+		i.errors.Add(1)
 	case EventRemove:
 		i.removes.Add(1)
 	case EventExpire:

@@ -1,6 +1,8 @@
 package stash
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -13,14 +15,7 @@ type Stash struct {
 
 type item struct {
 	Object interface{}
-	expire *time.Time
-}
-
-func (item item) Expired() bool {
-	if item.expire == nil {
-		return false
-	}
-	return item.expire.Before(time.Now())
+	expire int64
 }
 
 type stash struct {
@@ -37,22 +32,17 @@ type stash struct {
 // Set Add an item to the stash, replacing any existing item.
 // If the duration is 0 (DefaultExpiration), the stash's default expiration time is used.
 // If it is -1 (NoExpire), the item never expires.
-func (c *stash) Set(key string, i ...interface{}) bool {
+func (c *stash) Set(key string, i ...interface{}) error {
 	if len(i) == 0 || i[0] == nil {
-		return false
+		return errors.New("object not provided")
 	}
 	if c.lenLimit > 0 && c.lenCurrent >= c.lenLimit {
-		return false
+		return errors.New("len limit reached")
 	}
 	key = strings.Clone(key)
-	var expire *time.Time
-	if len(i) > 1 {
-		expire = c.toTime(i[1])
-	} else {
-		expire = c.toTime(c.expirePeriod)
-	}
-	if expire != nil && expire.Before(time.Now()) {
-		return false
+	expire, err := c.resolveTime(i...)
+	if err != nil {
+		return err
 	}
 	c.mu.Lock()
 	if v, ok := c.items[key]; ok {
@@ -70,30 +60,25 @@ func (c *stash) Set(key string, i ...interface{}) bool {
 	// Calls to mu.Unlock are currently not deferred because defer
 	// adds ~200 ns (as of go1.)
 	c.mu.Unlock()
-	return true
+	return nil
 }
 
 // Touch if item exist in stash stash, replacing any existing item.
 // If the duration is 0 (DefaultExpiration), the stash's default expiration time is used.
 // If it is -1 (NoExpiration), the item never expires.
-func (c *stash) Touch(key string, i ...interface{}) (touched bool) {
-	var expire *time.Time
-	if len(i) > 0 {
-		expire = c.toTime(i[1])
-	} else {
-		expire = c.toTime(c.expirePeriod)
-	}
-	if expire != nil && expire.Before(time.Now()) {
-		return false
+func (c *stash) Touch(key string, i ...interface{}) error {
+	expire, err := c.resolveTime(i...)
+	if err != nil {
+		return err
 	}
 	c.mu.Lock()
-	if item, ok := c.items[key]; ok {
+	item, ok := c.items[key]
+	if ok {
 		item.expire = expire
-		touched = true
 		go c.events.fire(EventTouch, key, item.Object)
 	}
 	c.mu.Unlock()
-	return
+	return nil
 }
 
 // Remove an item from the stash.
@@ -104,7 +89,7 @@ func (c *stash) Remove(key string) (interface{}, bool) {
 
 // Remove an item from the stash.
 // Returns the item or nil,// and a bool indicating if the key was found and deleted.
-func (c *stash) remove(key string, event StashEvent) (interface{}, bool) {
+func (c *stash) remove(key string, event Event) (interface{}, bool) {
 	key = strings.Clone(key)
 	c.mu.Lock()
 	o, ok := c.items[key]
@@ -124,12 +109,24 @@ func (c *stash) Get(key string) (interface{}, bool) {
 	c.mu.RLock()
 	item, ok := c.items[key]
 	c.mu.RUnlock()
-	if !ok || item.Expired() {
+	if !ok || (item.expire > 0 && item.expire < time.Now().UnixNano()) {
 		go c.events.fire(EventMiss, key, nil)
 		return nil, false
 	}
 	go c.events.fire(EventGet, key, item)
 	return item.Object, true
+}
+
+func (c *stash) GetString(key string) (string, bool) {
+	v, ok := c.Get(key)
+	if !ok {
+		return "", ok
+	}
+	switch v.(type) {
+	case string:
+		return v.(string), ok
+	}
+	return fmt.Sprintf("%v", v), ok
 }
 
 // Len Returns the number of items in the stash. This may include items that have
@@ -153,45 +150,62 @@ func (c *stash) Flush() {
 }
 
 // Flush Delete expired items from the stash.
-func (c *stash) expire(event StashEvent) {
-	expiredItems := make(map[string]interface{})
+func (c *stash) expire(event Event) {
+	expiredItems := make([]string, 0)
+	curTime := time.Now().UnixNano()
 	c.mu.RLock()
 	for key, item := range c.items {
-		if item.Expired() {
-			expiredItems[key] = item.Object
+		if item.expire > 0 && item.expire < curTime {
+			expiredItems = append(expiredItems, key)
 		}
 	}
 	c.mu.RUnlock()
-	go func(removed map[string]interface{}) {
-		for key, _ := range removed {
+	go func(removed []string) {
+		for _, key := range removed {
 			c.remove(key, event)
 		}
 	}(expiredItems)
 }
 
-func (c *stash) toTime(i interface{}) *time.Time {
+func (c *stash) resolveTime(i ...interface{}) (expire int64, err error) {
+	if len(i) > 1 {
+		expire = toTime(i[1])
+	}
+	if expire == int64(DefaultExpire) {
+		expire = toTime(c.expirePeriod)
+	}
+	if expire > 0 && expire < time.Now().UnixNano() {
+		err = errors.New("expire time is in the past")
+	}
+	return
+}
+
+func toTime(i interface{}) int64 {
 	if i == nil {
-		return nil
+		return int64(NoExpire)
 	}
 	switch i.(type) {
-	case int, uint, int8, uint8, int16, uint16, int32, uint32, int64, uint64:
-		return c.toTime(time.Second * time.Duration(i.(int64)))
+	case int, int8, int16, int32, int64:
+		return toTime(time.Second * time.Duration(i.(int64)))
+	case uint, uint8, uint16, uint32, uint64:
+		return toTime(time.Second * time.Duration(i.(uint64)))
 	case time.Duration:
 		dur := i.(time.Duration)
 		switch dur {
 		case DefaultExpire:
-			dur = c.expirePeriod
+			return int64(DefaultExpire)
 		case NoExpire:
-			return nil
+			return int64(NoExpire)
 		}
-		return c.toTime(time.Now().Add(dur))
+		return toTime(time.Now().Add(dur))
 	case time.Time:
-		t := i.(time.Time)
-		return &t
+		return i.(time.Time).UnixNano()
 	case *time.Time:
-		return i.(*time.Time)
+		if t := i.(*time.Time); t != nil {
+			return i.(*time.Time).UnixNano()
+		}
 	}
-	return c.toTime(c.expirePeriod)
+	return int64(DefaultExpire)
 }
 
 type events struct {
